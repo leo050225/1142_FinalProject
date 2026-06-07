@@ -89,5 +89,5 @@ python app.py
 * **穩定性防護**：自定義的 Python 函式皆加上了預設值參數（例如時間動態計算），防止 Gemini 在調用 Tool 時漏填參數導致程式報錯。
 * **Serverless 優化**：已將原先的異步 Thread 機制移除，確保在雲端 FaaS 平台上能完整等待 AI 運算完畢後再行釋放，100% 避免漏訊問題。
 
-## 加入LineBot
-![LINE Bot 畫面截圖](https://qr-official.line.me/sid/L/650tslqq.png)
+## LineBot邀請連結
+![LineBot邀請連結](images/linebot.png)
