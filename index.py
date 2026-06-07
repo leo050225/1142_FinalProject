@@ -37,7 +37,7 @@ client = genai.Client(api_key=GOOGLE_API_KEY)
 # --- 2. 定義 Python 函式 (AI 工具庫) ---
 
 def search_stock_id_by_name(name: str) -> str:
-    """根據台灣公司的中文名稱或關鍵字（例如 '台積電'、'鴻海'、'富邦金'），查詢並找出對應的台灣股票代碼。
+    """根據台灣公司的中文名稱或關鍵字（例如 '台積電'、'鴻海'），查詢並找出對應的台灣股票代碼。
 
     Args:
         name: 公司的中文名稱或簡稱關鍵字。
@@ -51,7 +51,7 @@ def search_stock_id_by_name(name: str) -> str:
         if response.status_code == 200:
             data = response.json().get("data", [])
             if not data:
-                return f"無法取得台灣股票清單。"
+                return "無法取得台灣股票清單。"
             
             # 模糊比對：尋找名稱包含關鍵字的股票
             matched_stocks = []
@@ -133,7 +133,7 @@ def get_realtime_stock_snapshot(data_id: str) -> str:
     except Exception as e:
         return f"呼叫即時股票 API 時發生異常: {str(e)}"
 
-# 建立工具映射表 (新增了 search_stock_id_by_name)
+# 工具映射表
 tools_map = {
     "search_stock_id_by_name": search_stock_id_by_name,
     "get_historical_stock_data": get_historical_stock_data,
@@ -148,12 +148,13 @@ def process_gemini_and_reply(user_message, reply_token):
     PRIMARY_MODEL = 'gemini-2.5-flash'
     FALLBACK_MODEL = 'gemini-1.5-flash'
     
-    # 將新工具加入配置中
+    # 強化 System Instruction，命令 AI 在獲得工具結果後一定要說話，不能返回空文字
     config = types.GenerateContentConfig(
         system_instruction=(
             "妳是一個專業的台灣股市投資助手 Line 機器人。請務必使用繁體中文進行最終親切、扼要的回答。\n"
-            "當使用者只提供公司名稱（例如：台積電、星宇航空、星巴克）時，妳必須先使用 `search_stock_id_by_name` 工具查出代碼，"
-            "再根據使用者的意圖（查即時或歷史）去調用相對應的股價工具。"
+            "當使用者只提供公司名稱（例如：台積電、鴻海）時，妳必須先使用 `search_stock_id_by_name` 工具查出代碼，"
+            "再根據使用者的意圖去調用相對應的股價工具。\n"
+            "【重要限制】當所有工具（Tools）執行完畢並取得資料後，妳必須根據這些獲得的數據，組織成一段溫暖親切的繁體中文語句回答使用者，絕對不可回傳空白內容！"
         ),
         tools=[search_stock_id_by_name, get_historical_stock_data, get_realtime_stock_snapshot],
         temperature=0.1
@@ -198,7 +199,6 @@ def process_gemini_and_reply(user_message, reply_token):
         
         # 使用 while 迴圈處理可能產生的「連續多個/多輪」Function Calls
         while response.function_calls:
-            # 紀錄 AI 當下的決策（包含它想呼叫什麼工具）
             chats.append(response.candidates[0].content)
             
             tool_parts = []
@@ -217,24 +217,26 @@ def process_gemini_and_reply(user_message, reply_token):
                         )
                     )
             
-            # 將工具的執行結果塞回對話紀錄中
             if tool_parts:
                 chats.append(types.Content(role="tool", parts=tool_parts))
             
             # 再次呼叫 Gemini，讓它根據剛剛的工具結果決定「下一步」
-            # 如果是問「台積電股價」，這一輪 Gemini 就會拿到「2330」，並在此產生第二個 function_call（查即時股價）
             response = _call_gemini_with_retry(contents=chats)
         
-        # 當沒有更多 function_calls 時，最後的 response.text 就是統整好的回答
-        final_answer = response.text
+        # [防呆機制優化]：當沒有更多 function_calls 時，檢查 response.text 是否為空值
+        if response.text and response.text.strip():
+            final_answer = response.text
+        else:
+            print("警告：Gemini 的最後一輪回應中 response.text 為 None 或空字串。")
+            final_answer = "我已經成功幫您調用 API 獲取股價資訊，但剛才大腦組織文字時不小心落空了 😵。可以請您再對我說一次指令試試看嗎？"
 
     except Exception as e:
         print(f"Gemini Ultimate Error: {str(e)}")
         err_msg = str(e)
         if "503" in err_msg or "UNAVAILABLE" in err_msg:
-            final_answer = "系統太熱門了！AI 伺服器目前有點忙不過來 \n請過幾秒鐘再對我發問一次試試看喔！"
+            final_answer = "系統太熱門了！AI 伺服器目前有點忙不過來 🥵\n請過幾秒鐘再對我發問一次試試看喔！"
         else:
-            final_answer = "抱歉，我的大腦剛才開了一點小差，沒能成功取得資料 \n請您再試著重新輸入一次指令！"
+            final_answer = "抱歉，我的大腦剛才開了一點小差，沒能成功取得資料 🤯\n請您再試著重新輸入一次指令！"
 
     # 回傳給 LINE 使用者
     try:
