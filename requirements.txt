@@ -1,0 +1,6 @@
+Flask
+requests
+line-bot-sdk
+langchain
+langchain-core
+langchain-google-genai
