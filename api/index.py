@@ -1,6 +1,6 @@
 import os
 import requests
-import threading  # 引入線程庫，解決 Vercel / Line 超時問題
+import threading
 from flask import Flask, request, abort
 
 # Line 本地 SDK v3 引用
@@ -15,11 +15,10 @@ from linebot.v3.messaging import (
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
-# LangChain 核心與工具引用
-from langchain_core.tools import tool
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.agents import create_structured_chat_agent, AgentExecutor
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+# 移除 LangChain，改用 Google 官方原生的 google-genai SDK
+# 請確保在 requirements.txt 中加入 google-genai
+from google import genai
+from google.genai import types
 
 app = Flask(__name__)
 
@@ -31,12 +30,19 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
+# 初始化原生的 Gemini Client
+client = genai.Client(api_key=GOOGLE_API_KEY)
 
-# --- 2. 定義 LangChain Tools ---
-@tool
+
+# --- 2. 定義 Python 函式 (供 Gemini Function Calling 使用) ---
+
 def get_historical_stock_data(data_id: str, start_date: str, end_date: str) -> str:
-    """
-    查詢台灣股市的歷史或通用股票數據（例如每日收盤價、成交量等）。
+    """查詢台灣股市的歷史或通用股票數據（例如每日收盤價、成交量等）。
+
+    Args:
+        data_id: 股票代碼（例如 '2330'）。
+        start_date: 開始日期，格式為 YYYY-MM-DD。
+        end_date: 結束日期，格式為 YYYY-MM-DD。
     """
     url = "https://api.finmindtrade.com/api/v4/data"
     params = {
@@ -61,10 +67,11 @@ def get_historical_stock_data(data_id: str, start_date: str, end_date: str) -> s
         return f"呼叫歷史股票 API 時發生異常: {str(e)}"
 
 
-@tool
 def get_realtime_stock_snapshot(data_id: str) -> str:
-    """
-    查詢台灣股市當前的即時盤中快照資訊（最新成交價、今日開盤等）。
+    """查詢台灣股市當前的即時盤中快照資訊（最新成交價、今日開盤等）。
+
+    Args:
+        data_id: 股票代碼（例如 '2330'）。
     """
     url = "https://api.finmindtrade.com/api/v4/taiwan_stock_tick_snapshot"
     params = {"data_id": data_id}
@@ -86,63 +93,77 @@ def get_realtime_stock_snapshot(data_id: str) -> str:
     except Exception as e:
         return f"呼叫即時股票 API 時發生異常: {str(e)}"
 
-tools = [get_historical_stock_data, get_realtime_stock_snapshot]
+# 建立工具映射表，方便後面動態呼叫
+tools_map = {
+    "get_historical_stock_data": get_historical_stock_data,
+    "get_realtime_stock_snapshot": get_realtime_stock_snapshot
+}
 
 
-# --- 3. 初始化 LangChain Agent ---
-llm = ChatGoogleGenerativeAI(
-    model="gemini-1.5-flash",
-    google_api_key=GOOGLE_API_KEY,
-    temperature=0.1
-)
-
-prompt_template = ChatPromptTemplate.from_messages([
-    ("system", (
-        "妳是一個專業的台灣股市投資助手 Line 機器人。妳擁有調用 FinMind 股票 API 工具的能力。\n"
-        "請務必使用繁體中文進行最終親切、扼要的回答。\n\n"
-        "妳必須且只能使用以下工具來協助妳回答問題：\n"
-        "{tools}\n\n"
-        "【重要】工具呼叫格式規範：妳必須以 Markdown JSON 程式碼區塊回應，結構如下：\n"
-        "```json\n"
-        "{{\n"
-        "  \"action\": \"工具名稱\",\n"
-        "  \"action_input\": {{\n"
-        "    \"參數名\": \"參數值\"\n"
-        "  }}\n"
-        "}}\n"
-        "```\n"
-        "當妳取得工具回傳的結果，準備直接回答用戶時，妳的最終回應必須嚴格符合以下 JSON 格式：\n"
-        "```json\n"
-        "{{\n"
-        "  \"action\": \"Final Answer\",\n"
-        "  \"action_input\": \"這裡輸入妳要呈現在 Line 畫面上給用戶看的最終繁體中文回答內容。\"\n"
-        "}}\n"
-        "```"
-    )),
-    MessagesPlaceholder(variable_name="chat_history", optional=True),
-    ("human", "{input}\n\n{agent_scratchpad}")
-])
-
-agent = create_structured_chat_agent(llm, tools, prompt_template)
-agent_executor = AgentExecutor(
-    agent=agent,
-    tools=tools,
-    verbose=False,
-    handle_parsing_errors=True
-)
-
-
-# --- 4. 核心邏輯：背景執行 Agent 並回覆 Line ---
-def process_agent_and_reply(user_message, reply_token):
+# --- 3. 核心邏輯：Gemini 原生 Function Calling 與 Line 回覆 ---
+def process_gemini_and_reply(user_message, reply_token):
+    final_answer = ""
     try:
-        # 在背景線程中跑 AI 運算
-        agent_response = agent_executor.invoke({"input": user_message})
-        final_answer = agent_response.get("output", "抱歉，我暫時無法解讀這個問題。")
+        # 設定 System Instruction 與提供工具
+        config = types.GenerateContentConfig(
+            system_instruction="妳是一個專業的台灣股市投資助手 Line 機器人。請務必使用繁體中文進行最終親切、扼要的回答。",
+            tools=[get_historical_stock_data, get_realtime_stock_snapshot],
+            temperature=0.1
+        )
+        
+        # 第一輪對話：讓 Gemini 決定是否需要呼叫工具
+        response = client.models.generate_content(
+            model='gemini-1.5-flash',
+            contents=user_message,
+            config=config
+        )
+        
+        # 檢查 Gemini 是否發出 Function Call 請求
+        if response.function_calls:
+            # 建立對話紀錄，用於存放 Tool 執行的成果
+            chats = [
+                types.Content(role="user", parts=[types.Part.from_text(text=user_message)]),
+                response.candidates[0].content # 包含 function_calls 的模型回應
+            ]
+            
+            # 依序執行 Gemini 要求的所有 Function
+            for function_call in response.function_calls:
+                name = function_call.name
+                args = function_call.args
+                
+                if name in tools_map:
+                    # 執行對應的 Python 函式
+                    tool_result = tools_map[name](**args)
+                    
+                    # 將工具執行的結果包裝成 Gemini 規範的格式
+                    chats.append(
+                        types.Content(
+                            role="tool",
+                            parts=[
+                                types.Part.from_function_response(
+                                    name=name,
+                                    response={"result": tool_result}
+                                )
+                            ]
+                        )
+                    )
+            
+            # 第二輪對話：將工具結果丟回給 Gemini，讓它組織成最終的繁體中文回答
+            final_response = client.models.generate_content(
+                model='gemini-1.5-flash',
+                contents=chats,
+                config=config
+            )
+            final_answer = final_response.text
+        else:
+            # 如果不需呼叫工具，直接拿 Gemini 的回覆
+            final_answer = response.text
+
     except Exception as e:
-        print(f"Agent Error: {str(e)}")
+        print(f"Gemini Error: {str(e)}")
         final_answer = "系統忙碌中，在分析數據時發生錯誤，請稍後再試。"
 
-    # 運算完後才回傳給 Line 使用者
+    # 運算完後回傳給 Line 使用者
     try:
         with ApiClient(configuration) as api_client:
             messaging_api = MessagingApi(api_client)
@@ -156,7 +177,7 @@ def process_agent_and_reply(user_message, reply_token):
         print(f"Line Reply Error: {str(line_err)}")
 
 
-# --- 5. Flask Webhook 路由接收端 ---
+# --- 4. Flask Webhook 路由接收端 ---
 @app.route("/", methods=["GET", "POST"])
 def index():
     if request.method == "GET":
@@ -170,15 +191,17 @@ def index():
     except InvalidSignatureError:
         abort(400)
         
-    return "OK"  # 快速回傳 OK 給 Line 伺服器，防止 500 錯誤
+    return "OK"
 
 
-# --- 6. 監聽與處理 Line 訊息事件 ---
+# --- 5. 監聽與處理 Line 訊息事件 ---
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     user_message = event.message.text
     reply_token = event.reply_token
     
-    # 【關鍵修改】不要在主線程等 AI 跑完！
-    # 開啟新線程去跑 Agent，主線程立刻往下走並結束，讓 Flask 能一瞬間回傳 HTTP 200 "OK"
-    threading.Thread(target=process_agent_and_reply, args=(user_message, reply_token)).start()
+    # 保持原有設計：開新線程去跑 Gemini 與 API 請求，立馬回傳 OK 給 Line，完美避免 500 / 超時問題
+    threading.Thread(target=process_gemini_and_reply, args=(user_message, reply_token)).start()
+
+# 為了讓 Vercel 能夠正確抓到 WSGI 實例，暴露 app 變數
+app = app

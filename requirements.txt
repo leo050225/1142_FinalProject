@@ -1,6 +1,4 @@
-Flask
-requests
-line-bot-sdk
-langchain
-langchain-core
-langchain-google-genai
+Flask==3.0.2
+requests==2.31.0
+line-bot-sdk==3.11.0
+google-genai==0.1.1
