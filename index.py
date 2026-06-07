@@ -146,8 +146,8 @@ def process_gemini_and_reply(user_message, reply_token):
     final_answer = ""
     
     PRIMARY_MODEL = 'gemini-2.5-flash'
-    # 修正：全新 google-genai 原生 SDK 下支援的 1.5 輕量防禦模型名稱
-    FALLBACK_MODEL = 'gemini-1.5-flash-8b'  
+    # 🌟 修正：改用 2.0 世代標準主力模型，100% 相容新 SDK 且獨立計算 Quota 額度
+    FALLBACK_MODEL = 'gemini-2.0-flash'  
     
     config = types.GenerateContentConfig(
         system_instruction=(
@@ -172,7 +172,7 @@ def process_gemini_and_reply(user_message, reply_token):
             except Exception as e:
                 err_msg = str(e)
                 
-                # 優化：遇到 429 每日配額用光，重試也無法解決，直接跳出並嘗試切換至備援模型
+                # 遇到 429 每日配額用光，重試無法解決，直接跳出嘗試切換至備援模型
                 if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
                     print(f"[{PRIMARY_MODEL}] 觸發 429 額度限制，準備嘗試切換備援模型...")
                     break
@@ -236,7 +236,7 @@ def process_gemini_and_reply(user_message, reply_token):
             final_answer = response.text
         else:
             print("警告：Gemini 的最後一輪回應中 response.text 為 None 或空字串。")
-            final_answer = "我已經成功幫您調用 API 獲取股價資訊，但剛才大腦組織文字時不小心落空了 。可以請您再對我說一次指令試試看嗎？"
+            final_answer = "我已經成功幫您調用 API 獲取股價資訊，但剛才大腦組織文字時不小心落空了 😵。可以請您再對我說一次指令試試看嗎？"
 
     except Exception as e:
         print(f"Gemini Ultimate Error: {str(e)}")
@@ -244,11 +244,11 @@ def process_gemini_and_reply(user_message, reply_token):
         
         # 攔截 429 額度耗盡錯誤，向 LINE 使用者發出親切公告
         if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-            final_answer = "今天的小幫手免費額度已經用光了 （免費版每日限制 20 次請求）。\n請明天再來看我，或是提醒主人幫我升級為付費制 API 唷！"
+            final_answer = "今天的小幫手免費額度已經用光了 😭（免費版每日限制 20 次請求）。\n請明天再來看我，或是提醒主人幫我升級為付費制 API 唷！"
         elif "503" in err_msg or "UNAVAILABLE" in err_msg:
-            final_answer = "系統太熱門了！AI 伺服器目前有點忙不過來 \n請過幾秒鐘再對我發問一次試試看喔！"
+            final_answer = "系統太熱門了！AI 伺服器目前有點忙不過來 🥵\n請過幾秒鐘再對我發問一次試試看喔！"
         else:
-            final_answer = "抱歉，我的大腦剛才開了一點小差，沒能成功取得資料 \n請您再試著重新輸入一次指令！"
+            final_answer = "抱歉，我的大腦剛才開了一點小差，沒能成功取得資料 🤯\n請您再試著重新輸入一次指令！"
 
     # 回傳給 LINE 使用者
     try:
