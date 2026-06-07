@@ -1,6 +1,6 @@
 import os
+import time
 import requests
-import threading
 from datetime import datetime, timedelta
 from flask import Flask, request, abort
 
@@ -34,7 +34,41 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 client = genai.Client(api_key=GOOGLE_API_KEY)
 
 
-# --- 2. 定義 Python 函式 (加上預設值，避免 Gemini 沒填參數而崩潰) ---
+# --- 2. 定義 Python 函式 (AI 工具庫) ---
+
+def search_stock_id_by_name(name: str) -> str:
+    """根據台灣公司的中文名稱或關鍵字（例如 '台積電'、'鴻海'、'富邦金'），查詢並找出對應的台灣股票代碼。
+
+    Args:
+        name: 公司的中文名稱或簡稱關鍵字。
+    """
+    url = "https://api.finmindtrade.com/api/v4/data"
+    params = {
+        "dataset": "TaiwanStockInfo"
+    }
+    try:
+        response = requests.get(url, params=params, timeout=5)
+        if response.status_code == 200:
+            data = response.json().get("data", [])
+            if not data:
+                return f"無法取得台灣股票清單。"
+            
+            # 模糊比對：尋找名稱包含關鍵字的股票
+            matched_stocks = []
+            for row in data:
+                stock_name = row.get("stock_name", "")
+                stock_id = row.get("stock_id", "")
+                if name in stock_name:
+                    matched_stocks.append(f"{stock_name}({stock_id})")
+            
+            if matched_stocks:
+                return "找到相符的台灣股票對照如下：\n" + "\n".join(matched_stocks)
+            else:
+                return f"找不到名稱包含 '{name}' 的台灣股票。請檢查名稱是否正確。"
+        return f"股票代碼查詢 API 連線失敗，狀態碼: {response.status_code}"
+    except Exception as e:
+        return f"呼叫股票代碼查詢 API 時發生異常: {str(e)}"
+
 
 def get_historical_stock_data(data_id: str, start_date: str = None, end_date: str = None) -> str:
     """查詢台灣股市的歷史或通用股票數據（例如每日收盤價、成交量等）。
@@ -44,7 +78,6 @@ def get_historical_stock_data(data_id: str, start_date: str = None, end_date: st
         start_date: 開始日期，格式為 YYYY-MM-DD。若未提供，預設為一個月前。
         end_date: 結束日期，格式為 YYYY-MM-DD。若未提供，預設為今天。
     """
-    # 動態計算預設時間
     today = datetime.today()
     if not end_date:
         end_date = today.strftime('%Y-%m-%d')
@@ -100,8 +133,9 @@ def get_realtime_stock_snapshot(data_id: str) -> str:
     except Exception as e:
         return f"呼叫即時股票 API 時發生異常: {str(e)}"
 
-# 建立工具映射表
+# 建立工具映射表 (新增了 search_stock_id_by_name)
 tools_map = {
+    "search_stock_id_by_name": search_stock_id_by_name,
     "get_historical_stock_data": get_historical_stock_data,
     "get_realtime_stock_snapshot": get_realtime_stock_snapshot
 }
@@ -111,63 +145,96 @@ tools_map = {
 def process_gemini_and_reply(user_message, reply_token):
     final_answer = ""
     
-    target_model = 'gemini-2.5-flash' 
+    PRIMARY_MODEL = 'gemini-2.5-flash'
+    FALLBACK_MODEL = 'gemini-1.5-flash'
     
+    # 將新工具加入配置中
+    config = types.GenerateContentConfig(
+        system_instruction=(
+            "妳是一個專業的台灣股市投資助手 Line 機器人。請務必使用繁體中文進行最終親切、扼要的回答。\n"
+            "當使用者只提供公司名稱（例如：台積電、星宇航空、星巴克）時，妳必須先使用 `search_stock_id_by_name` 工具查出代碼，"
+            "再根據使用者的意圖（查即時或歷史）去調用相對應的股價工具。"
+        ),
+        tools=[search_stock_id_by_name, get_historical_stock_data, get_realtime_stock_snapshot],
+        temperature=0.1
+    )
+
+    def _call_gemini_with_retry(contents, max_retries=3, initial_delay=2):
+        delay = initial_delay
+        for attempt in range(max_retries):
+            try:
+                return client.models.generate_content(
+                    model=PRIMARY_MODEL,
+                    contents=contents,
+                    config=config
+                )
+            except Exception as e:
+                err_msg = str(e)
+                if ("503" in err_msg or "UNAVAILABLE" in err_msg) and attempt < max_retries - 1:
+                    print(f"[{PRIMARY_MODEL}] 遇到 503 過載，將於 {delay} 秒後進行第 {attempt + 1} 次重試...")
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                else:
+                    print(f"[{PRIMARY_MODEL}] 失敗，嘗試備援模型。錯誤: {err_msg}")
+                    break
+        try:
+            print(f"啟動備援機制，改用模型: {FALLBACK_MODEL}")
+            return client.models.generate_content(
+                model=FALLBACK_MODEL,
+                contents=contents,
+                config=config
+            )
+        except Exception as fallback_err:
+            raise fallback_err
+
+    # 執行主邏輯
     try:
-        config = types.GenerateContentConfig(
-            system_instruction="妳是一個專業的台灣股市投資助手 Line 機器人。請務必使用繁體中文進行最終親切、扼要的回答。",
-            tools=[get_historical_stock_data, get_realtime_stock_snapshot],
-            temperature=0.1
-        )
-        
         # 第一輪對話
-        response = client.models.generate_content(
-            model=target_model,
-            contents=user_message,
-            config=config
-        )
+        response = _call_gemini_with_retry(contents=user_message)
         
-        # 檢查是否需要執行 Function Call
-        if response.function_calls:
-            chats = [
-                types.Content(role="user", parts=[types.Part.from_text(text=user_message)]),
-                response.candidates[0].content 
-            ]
+        # 建立歷史對話結構，準備記錄多輪 Function Calling
+        chats = [types.Content(role="user", parts=[types.Part.from_text(text=user_message)])]
+        
+        # 使用 while 迴圈處理可能產生的「連續多個/多輪」Function Calls
+        while response.function_calls:
+            # 紀錄 AI 當下的決策（包含它想呼叫什麼工具）
+            chats.append(response.candidates[0].content)
             
+            tool_parts = []
             for function_call in response.function_calls:
                 name = function_call.name
                 args = function_call.args
                 
                 if name in tools_map:
-                    # 執行 Python 函式取得字串結果
+                    # 執行工具
                     tool_result = tools_map[name](**args)
-                    
-                    # 修正：將原生字串包裝成符合 SDK 規範的 Response 結構
-                    chats.append(
-                        types.Content(
-                            role="tool",
-                            parts=[
-                                types.Part.from_function_response(
-                                    name=name,
-                                    response={"output": str(tool_result)} # 修正字典結構
-                                )
-                            ]
+                    # 包裝成符合 SDK 規範的 Response
+                    tool_parts.append(
+                        types.Part.from_function_response(
+                            name=name,
+                            response={"output": str(tool_result)}
                         )
                     )
             
-            # 第二輪對話
-            final_response = client.models.generate_content(
-                model=target_model,
-                contents=chats,
-                config=config
-            )
-            final_answer = final_response.text
-        else:
-            final_answer = response.text
+            # 將工具的執行結果塞回對話紀錄中
+            if tool_parts:
+                chats.append(types.Content(role="tool", parts=tool_parts))
+            
+            # 再次呼叫 Gemini，讓它根據剛剛的工具結果決定「下一步」
+            # 如果是問「台積電股價」，這一輪 Gemini 就會拿到「2330」，並在此產生第二個 function_call（查即時股價）
+            response = _call_gemini_with_retry(contents=chats)
+        
+        # 當沒有更多 function_calls 時，最後的 response.text 就是統整好的回答
+        final_answer = response.text
 
     except Exception as e:
-        print(f"Gemini Error: {str(e)}")
-        final_answer = f"系統忙碌中，錯誤回報：{str(e)}"
+        print(f"Gemini Ultimate Error: {str(e)}")
+        err_msg = str(e)
+        if "503" in err_msg or "UNAVAILABLE" in err_msg:
+            final_answer = "系統太熱門了！AI 伺服器目前有點忙不過來 \n請過幾秒鐘再對我發問一次試試看喔！"
+        else:
+            final_answer = "抱歉，我的大腦剛才開了一點小差，沒能成功取得資料 \n請您再試著重新輸入一次指令！"
 
     # 回傳給 LINE 使用者
     try:
@@ -206,7 +273,6 @@ def handle_message(event):
     user_message = event.message.text
     reply_token = event.reply_token
     
-    # 🔴 移除原本的 threading.Thread，改為直接同步呼叫
-    # 這樣 Vercel 就會乖乖等 Gemini 發出對外請求並等回覆完畢後，才結束這次的 Function
     process_gemini_and_reply(user_message, reply_token)
+
 app = app
