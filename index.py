@@ -206,7 +206,7 @@ def handle_message(event):
     user_message = event.message.text
     reply_token = event.reply_token
     
-    # 開非同步執行緒跑 Gemini
-    threading.Thread(target=process_gemini_and_reply, args=(user_message, reply_token)).start()
-
+    # 🔴 移除原本的 threading.Thread，改為直接同步呼叫
+    # 這樣 Vercel 就會乖乖等 Gemini 發出對外請求並等回覆完畢後，才結束這次的 Function
+    process_gemini_and_reply(user_message, reply_token)
 app = app
