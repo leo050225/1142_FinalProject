@@ -146,9 +146,9 @@ def process_gemini_and_reply(user_message, reply_token):
     final_answer = ""
     
     PRIMARY_MODEL = 'gemini-2.5-flash'
-    FALLBACK_MODEL = 'gemini-1.5-flash'
+    # 修正：全新 google-genai 原生 SDK 下支援的 1.5 輕量防禦模型名稱
+    FALLBACK_MODEL = 'gemini-1.5-flash-8b'  
     
-    # 強化 System Instruction，命令 AI 在獲得工具結果後一定要說話，不能返回空文字
     config = types.GenerateContentConfig(
         system_instruction=(
             "妳是一個專業的台灣股市投資助手 Line 機器人。請務必使用繁體中文進行最終親切、扼要的回答。\n"
@@ -171,13 +171,20 @@ def process_gemini_and_reply(user_message, reply_token):
                 )
             except Exception as e:
                 err_msg = str(e)
+                
+                # 優化：遇到 429 每日配額用光，重試也無法解決，直接跳出並嘗試切換至備援模型
+                if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+                    print(f"[{PRIMARY_MODEL}] 觸發 429 額度限制，準備嘗試切換備援模型...")
+                    break
+                
+                # 遇到 503 伺服器繁忙，採取指數型延遲重試
                 if ("503" in err_msg or "UNAVAILABLE" in err_msg) and attempt < max_retries - 1:
                     print(f"[{PRIMARY_MODEL}] 遇到 503 過載，將於 {delay} 秒後進行第 {attempt + 1} 次重試...")
                     time.sleep(delay)
                     delay *= 2
                     continue
                 else:
-                    print(f"[{PRIMARY_MODEL}] 失敗，嘗試備援模型。錯誤: {err_msg}")
+                    print(f"[{PRIMARY_MODEL}] 失敗或發生未知異常，嘗試進入備援階段。錯誤: {err_msg}")
                     break
         try:
             print(f"啟動備援機制，改用模型: {FALLBACK_MODEL}")
@@ -187,6 +194,7 @@ def process_gemini_and_reply(user_message, reply_token):
                 config=config
             )
         except Exception as fallback_err:
+            # 如果連備援模型都失敗（例如全線額度耗盡），則拋出給外層處理
             raise fallback_err
 
     # 執行主邏輯
@@ -197,7 +205,7 @@ def process_gemini_and_reply(user_message, reply_token):
         # 建立歷史對話結構，準備記錄多輪 Function Calling
         chats = [types.Content(role="user", parts=[types.Part.from_text(text=user_message)])]
         
-        # 使用 while 迴圈處理可能產生的「連續多個/多輪」Function Calls
+        # 使用 while 迴圈處理多輪推理鏈工具調用
         while response.function_calls:
             chats.append(response.candidates[0].content)
             
@@ -220,23 +228,27 @@ def process_gemini_and_reply(user_message, reply_token):
             if tool_parts:
                 chats.append(types.Content(role="tool", parts=tool_parts))
             
-            # 再次呼叫 Gemini，讓它根據剛剛的工具結果決定「下一步」
+            # 再次呼叫 Gemini 推理下一步
             response = _call_gemini_with_retry(contents=chats)
         
-        # [防呆機制優化]：當沒有更多 function_calls 時，檢查 response.text 是否為空值
+        # 防崩潰防呆判斷：檢查 response.text 是否有效
         if response.text and response.text.strip():
             final_answer = response.text
         else:
             print("警告：Gemini 的最後一輪回應中 response.text 為 None 或空字串。")
-            final_answer = "我已經成功幫您調用 API 獲取股價資訊，但剛才大腦組織文字時不小心落空了 😵。可以請您再對我說一次指令試試看嗎？"
+            final_answer = "我已經成功幫您調用 API 獲取股價資訊，但剛才大腦組織文字時不小心落空了 。可以請您再對我說一次指令試試看嗎？"
 
     except Exception as e:
         print(f"Gemini Ultimate Error: {str(e)}")
         err_msg = str(e)
-        if "503" in err_msg or "UNAVAILABLE" in err_msg:
-            final_answer = "系統太熱門了！AI 伺服器目前有點忙不過來 🥵\n請過幾秒鐘再對我發問一次試試看喔！"
+        
+        # 攔截 429 額度耗盡錯誤，向 LINE 使用者發出親切公告
+        if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+            final_answer = "今天的小幫手免費額度已經用光了 （免費版每日限制 20 次請求）。\n請明天再來看我，或是提醒主人幫我升級為付費制 API 唷！"
+        elif "503" in err_msg or "UNAVAILABLE" in err_msg:
+            final_answer = "系統太熱門了！AI 伺服器目前有點忙不過來 \n請過幾秒鐘再對我發問一次試試看喔！"
         else:
-            final_answer = "抱歉，我的大腦剛才開了一點小差，沒能成功取得資料 🤯\n請您再試著重新輸入一次指令！"
+            final_answer = "抱歉，我的大腦剛才開了一點小差，沒能成功取得資料 \n請您再試著重新輸入一次指令！"
 
     # 回傳給 LINE 使用者
     try:
