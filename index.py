@@ -22,16 +22,33 @@ from google.genai import types
 
 app = Flask(__name__)
 
-# --- 1. 環境變數驗證 ---
+# --- 1. 環境變數驗證與多金鑰載入 ---
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# 初始化原生的 Gemini Client
-client = genai.Client(api_key=GOOGLE_API_KEY)
+# 🌟 [多帳號金鑰讀取優化]
+# 你可以在環境變數設定 GOOGLE_API_KEY_1, GOOGLE_API_KEY_2, GOOGLE_API_KEY_3... 
+# 程式會自動掃描並加入清單，如果都沒設定，則保底讀取原本的 GOOGLE_API_KEY
+api_keys = []
+idx = 1
+while True:
+    key = os.getenv(f"GOOGLE_API_KEY_{idx}")
+    if key:
+        api_keys.append(key)
+        idx += 1
+    else:
+        break
+
+# 如果沒有 GOOGLE_API_KEY_1 這種格式，就讀原本傳統的單一變數
+if not api_keys:
+    default_key = os.getenv("GOOGLE_API_KEY")
+    if default_key:
+        api_keys.append(default_key)
+
+print(f"系統成功載入 {len(api_keys)} 組 Google API 金鑰，將啟用自動輪替配額防禦機制！")
 
 
 # --- 2. 定義 Python 函式 (AI 工具庫) ---
@@ -43,9 +60,7 @@ def search_stock_id_by_name(name: str) -> str:
         name: 公司的中文名稱或簡稱關鍵字。
     """
     url = "https://api.finmindtrade.com/api/v4/data"
-    params = {
-        "dataset": "TaiwanStockInfo"
-    }
+    params = {"dataset": "TaiwanStockInfo"}
     try:
         response = requests.get(url, params=params, timeout=5)
         if response.status_code == 200:
@@ -53,7 +68,6 @@ def search_stock_id_by_name(name: str) -> str:
             if not data:
                 return "無法取得台灣股票清單。"
             
-            # 模糊比對：尋找名稱包含關鍵字的股票
             matched_stocks = []
             for row in data:
                 stock_name = row.get("stock_name", "")
@@ -146,7 +160,6 @@ def process_gemini_and_reply(user_message, reply_token):
     final_answer = ""
     
     PRIMARY_MODEL = 'gemini-2.5-flash'
-    # 🌟 修正：改用 2.0 世代標準主力模型，100% 相容新 SDK 且獨立計算 Quota 額度
     FALLBACK_MODEL = 'gemini-2.0-flash'  
     
     config = types.GenerateContentConfig(
@@ -160,47 +173,62 @@ def process_gemini_and_reply(user_message, reply_token):
         temperature=0.1
     )
 
-    def _call_gemini_with_retry(contents, max_retries=3, initial_delay=2):
-        delay = initial_delay
-        for attempt in range(max_retries):
+    # 🌟 [超級進化：多金鑰自動重試輪替輔助函式]
+    def _call_gemini_with_key_loop(contents):
+        """依序嘗試所有的 API 金鑰，若遇到 429 額度用盡，自動用下一組金鑰重新初始化 Client 繼續請求"""
+        if not api_keys:
+            raise Exception("環境變數中找不到任何有效的 GOOGLE_API_KEY。")
+            
+        err_msg = ""
+        # 輪流嘗試每一組金鑰
+        for k_idx, current_key in enumerate(api_keys):
+            # 建立當前金鑰的臨時 Client
+            temp_client = genai.Client(api_key=current_key)
+            
+            # 對於當前這個金鑰，同樣保有一套 503 繁忙自動重試機制 (最多重試 2 次)
+            for attempt in range(2):
+                try:
+                    return temp_client.models.generate_content(
+                        model=PRIMARY_MODEL,
+                        contents=contents,
+                        config=config
+                    )
+                except Exception as e:
+                    err_msg = str(e)
+                    
+                    # 狀況 A：如果是 429 或是額度用完，重試無效，直接跳出 attempt 迴圈，換下一組 Key 試試看
+                    if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+                        print(f"[Key 序號 {k_idx+1}] 觸發 429 額度上限。自動切換至下一組金鑰...")
+                        break
+                        
+                    # 狀況 B：如果是 503 伺服器繁忙，稍微等一下再進行下一次 retry attempt
+                    if ("503" in err_msg or "UNAVAILABLE" in err_msg) and attempt < 1:
+                        time.sleep(2)
+                        continue
+                    else:
+                        break # 其他未知的異常，直接切換下一個 Key 或者進入備援
+                        
+        # 🛡️ 防禦線 2：如果「所有金鑰」在主要模型 (2.5-flash) 下都回報 429 額度滿了，就改用備援模型 (2.0-flash) 重新跑一次 Key 迴圈
+        print("所有配置的 API 金鑰在主要模型下皆已耗盡或異常，啟動二次防禦：嘗試備援模型。")
+        for k_idx, current_key in enumerate(api_keys):
             try:
-                return client.models.generate_content(
-                    model=PRIMARY_MODEL,
+                temp_client = genai.Client(api_key=current_key)
+                return temp_client.models.generate_content(
+                    model=FALLBACK_MODEL,
                     contents=contents,
                     config=config
                 )
-            except Exception as e:
-                err_msg = str(e)
+            except Exception as fallback_err:
+                err_msg = str(fallback_err)
+                continue # 如果這個 Key 在備援模型一樣不行，就再換下一個 Key
                 
-                # 遇到 429 每日配額用光，重試無法解決，直接跳出嘗試切換至備援模型
-                if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-                    print(f"[{PRIMARY_MODEL}] 觸發 429 額度限制，準備嘗試切換備援模型...")
-                    break
-                
-                # 遇到 503 伺服器繁忙，採取指數型延遲重試
-                if ("503" in err_msg or "UNAVAILABLE" in err_msg) and attempt < max_retries - 1:
-                    print(f"[{PRIMARY_MODEL}] 遇到 503 過載，將於 {delay} 秒後進行第 {attempt + 1} 次重試...")
-                    time.sleep(delay)
-                    delay *= 2
-                    continue
-                else:
-                    print(f"[{PRIMARY_MODEL}] 失敗或發生未知異常，嘗試進入備援階段。錯誤: {err_msg}")
-                    break
-        try:
-            print(f"啟動備援機制，改用模型: {FALLBACK_MODEL}")
-            return client.models.generate_content(
-                model=FALLBACK_MODEL,
-                contents=contents,
-                config=config
-            )
-        except Exception as fallback_err:
-            # 如果連備援模型都失敗（例如全線額度耗盡），則拋出給外層處理
-            raise fallback_err
+        # 如果走到這裡，代表所有 Key 在所有模型上都陣亡了，把最後的錯誤丟出去
+        raise Exception(f"All keys exhausted. Last error: {err_msg}")
 
     # 執行主邏輯
     try:
-        # 第一輪對話
-        response = _call_gemini_with_retry(contents=user_message)
+        # 第一輪對話 (由多金鑰輪替函式全權處理)
+        response = _call_gemini_with_key_loop(contents=user_message)
         
         # 建立歷史對話結構，準備記錄多輪 Function Calling
         chats = [types.Content(role="user", parts=[types.Part.from_text(text=user_message)])]
@@ -215,9 +243,7 @@ def process_gemini_and_reply(user_message, reply_token):
                 args = function_call.args
                 
                 if name in tools_map:
-                    # 執行工具
                     tool_result = tools_map[name](**args)
-                    # 包裝成符合 SDK 規範的 Response
                     tool_parts.append(
                         types.Part.from_function_response(
                             name=name,
@@ -228,23 +254,22 @@ def process_gemini_and_reply(user_message, reply_token):
             if tool_parts:
                 chats.append(types.Content(role="tool", parts=tool_parts))
             
-            # 再次呼叫 Gemini 推理下一步
-            response = _call_gemini_with_retry(contents=chats)
+            # 再次呼叫變更後的多金鑰輪替函式
+            response = _call_gemini_with_key_loop(contents=chats)
         
-        # 防崩潰防呆判斷：檢查 response.text 是否有效
+        # 檢查最後結果是否有效
         if response.text and response.text.strip():
             final_answer = response.text
         else:
-            print("警告：Gemini 的最後一輪回應中 response.text 為 None 或空字串。")
             final_answer = "我已經成功幫您調用 API 獲取股價資訊，但剛才大腦組織文字時不小心落空了 😵。可以請您再對我說一次指令試試看嗎？"
 
     except Exception as e:
         print(f"Gemini Ultimate Error: {str(e)}")
         err_msg = str(e)
         
-        # 攔截 429 額度耗盡錯誤，向 LINE 使用者發出親切公告
-        if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-            final_answer = "今天的小幫手免費額度已經用光了 😭（免費版每日限制 20 次請求）。\n請明天再來看我，或是提醒主人幫我升級為付費制 API 唷！"
+        # 如果連全線輪替都救不回來，說明真的全部額度在當天都乾涸了
+        if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "All keys exhausted" in err_msg:
+            final_answer = "今天小幫手背後配置的【所有免費帳號額度】都已經全數用光光了 😭。\n請明天再來發問，或者提醒主人幫我升級成綁定信用卡的付費制 API 唷！"
         elif "503" in err_msg or "UNAVAILABLE" in err_msg:
             final_answer = "系統太熱門了！AI 伺服器目前有點忙不過來 🥵\n請過幾秒鐘再對我發問一次試試看喔！"
         else:
