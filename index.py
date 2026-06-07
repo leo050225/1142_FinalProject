@@ -110,8 +110,8 @@ tools_map = {
 # --- 3. 核心邏輯：Gemini 原生 Function Calling 與 Line 回覆 ---
 def process_gemini_and_reply(user_message, reply_token):
     final_answer = ""
-    # 統一使用官方推薦的新版格式：gemini-1.5-flash
-    target_model = 'gemini-1.5-flash'
+    
+    target_model = 'gemini-2.5-flash' 
     
     try:
         config = types.GenerateContentConfig(
