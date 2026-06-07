@@ -131,9 +131,9 @@ def process_gemini_and_reply(user_message, reply_token):
     
     config = types.GenerateContentConfig(
         system_instruction=(
-            "妳是一個專業的台灣股市投資助手 Line 機器人。請務必使用繁體中文進行最終親切、扼要的回答。\n"
+            "你是一個專業的台灣股市投資助手 Line 機器人。請務必使用繁體中文進行回答。\n"
             "使用者會提供 4 位數的台灣股票代碼（例如：2330、2317），請根據使用者的意圖去調用相對應的股價工具。\n"
-            "【重要限制】當工具（Tools）執行完畢並取得資料後，妳必須根據這些獲得的數據，組織成一段溫暖親切的繁體中文語句回答使用者，絕對不可回傳空白內容！"
+            "【重要限制】當工具（Tools）執行完畢並取得資料後，妳必須根據這些獲得的數據，組織成一段資訊回答使用者，絕對不可回傳空白內容！"
         ),
         tools=[get_historical_stock_data, get_realtime_stock_snapshot], # 已移除名稱查詢工具
         temperature=0.1
@@ -213,18 +213,18 @@ def process_gemini_and_reply(user_message, reply_token):
         if response.text and response.text.strip():
             final_answer = response.text
         else:
-            final_answer = "我已經成功幫您調用 API 獲取股價資訊，但剛才大腦組織文字時不小心落空了 😵。可以請您再對我說一次指令試試看嗎？"
+            final_answer = "已經成功幫調用 API 獲取股價資訊，但發生錯誤 。請再說一次指令。"
 
     except Exception as e:
         print(f"Gemini Ultimate Error: {str(e)}")
         err_msg = str(e)
         
         if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "All keys exhausted" in err_msg:
-            final_answer = "今天小幫手背後配置的【所有免費帳號額度】都已經全數用光光了 😭。\n請明天再來發問，或者提醒主人幫我升級成付費制 API 唷！"
+            final_answer = "所有'免費帳號額度'都已經全數用光光了 。\n請明天再來發問！"
         elif "503" in err_msg or "UNAVAILABLE" in err_msg:
-            final_answer = "系統太熱門了！AI 伺服器目前有點忙不過來 🥵\n請過幾秒鐘再對我發問一次試試看喔！"
+            final_answer = "伺服器目前有點忙不過來 \n請過幾秒鐘再發問一次試試看！"
         else:
-            final_answer = "抱歉，我的大腦剛才開了一點小差，沒能成功取得資料 🤯\n請您再試著重新輸入一次指令！"
+            final_answer = "沒能成功取得資料 \n請您再試著重新輸入一次指令！"
 
     # 回傳給 LINE 使用者
     try:
